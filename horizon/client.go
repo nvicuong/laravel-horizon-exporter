@@ -8,10 +8,14 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
-const jobPageSize = 50
+const (
+	jobPageSize      = 50
+	metricFanoutLimit = 10
+)
 
 type Client struct {
 	baseURL    string
@@ -60,6 +64,33 @@ func (c *Client) get(path string, out interface{}) error {
 	return json.Unmarshal(body, out)
 }
 
+func (c *Client) fetchMetricSnapshots(prefix string, names []string) map[string]MetricSnapshot {
+	result := make(map[string]MetricSnapshot, len(names))
+	var mu sync.Mutex
+	sem := make(chan struct{}, metricFanoutLimit)
+	var wg sync.WaitGroup
+
+	for _, name := range names {
+		name := name
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			var snapshots []MetricSnapshot
+			path := prefix + url.PathEscape(name)
+			if err := c.get(path, &snapshots); err != nil || len(snapshots) == 0 {
+				return
+			}
+			mu.Lock()
+			result[name] = snapshots[len(snapshots)-1]
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return result
+}
+
 func (c *Client) GetStats() (*Stats, error) {
 	var stats Stats
 	if err := c.get("/horizon/api/stats", &stats); err != nil {
@@ -88,9 +119,6 @@ func (c *Client) GetMasters() ([]MasterSupervisor, error) {
 	return masters, nil
 }
 
-// getJobCounts paginates through all jobs at the given API path.
-// Horizon's PHP side treats starting_at="0" as falsy (→ -1), so we break as
-// soon as a page is not full (< 50 items) rather than relying on an empty page.
 func (c *Client) getJobCounts(apiPath string) (*JobCounts, error) {
 	counts := &JobCounts{
 		ByQueue: map[string]int64{},
@@ -98,6 +126,7 @@ func (c *Client) getJobCounts(apiPath string) (*JobCounts, error) {
 	}
 
 	cursor := int64(-1)
+	firstPage := true
 	for {
 		path := apiPath + "?starting_at=" + strconv.FormatInt(cursor, 10)
 		var page JobListResponse
@@ -105,14 +134,16 @@ func (c *Client) getJobCounts(apiPath string) (*JobCounts, error) {
 			return nil, err
 		}
 
-		counts.Total = page.Total
+		if firstPage {
+			counts.Total = page.Total
+			firstPage = false
+		}
 
 		for _, j := range page.Jobs {
 			counts.ByQueue[j.Queue]++
 			counts.ByClass[j.Name]++
 		}
 
-		// A page with fewer than jobPageSize items is the last page.
 		if len(page.Jobs) < jobPageSize {
 			break
 		}
@@ -160,16 +191,7 @@ func (c *Client) GetQueueMetrics() (map[string]MetricSnapshot, error) {
 	if err := c.get("/horizon/api/metrics/queues", &names); err != nil {
 		return nil, err
 	}
-	result := make(map[string]MetricSnapshot, len(names))
-	for _, name := range names {
-		var snapshots []MetricSnapshot
-		path := "/horizon/api/metrics/queues/" + url.PathEscape(name)
-		if err := c.get(path, &snapshots); err != nil || len(snapshots) == 0 {
-			continue
-		}
-		result[name] = snapshots[len(snapshots)-1]
-	}
-	return result, nil
+	return c.fetchMetricSnapshots("/horizon/api/metrics/queues/", names), nil
 }
 
 func (c *Client) GetJobMetrics() (map[string]MetricSnapshot, error) {
@@ -177,14 +199,5 @@ func (c *Client) GetJobMetrics() (map[string]MetricSnapshot, error) {
 	if err := c.get("/horizon/api/metrics/jobs", &names); err != nil {
 		return nil, err
 	}
-	result := make(map[string]MetricSnapshot, len(names))
-	for _, name := range names {
-		var snapshots []MetricSnapshot
-		path := "/horizon/api/metrics/jobs/" + url.PathEscape(name)
-		if err := c.get(path, &snapshots); err != nil || len(snapshots) == 0 {
-			continue
-		}
-		result[name] = snapshots[len(snapshots)-1]
-	}
-	return result, nil
+	return c.fetchMetricSnapshots("/horizon/api/metrics/jobs/", names), nil
 }

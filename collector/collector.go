@@ -2,7 +2,7 @@ package collector
 
 import (
 	"log"
-	"sync"
+	"strconv"
 
 	"github.com/horizon-exporter/horizon"
 	"github.com/prometheus/client_golang/prometheus"
@@ -12,16 +12,17 @@ const namespace = "horizon"
 
 type Collector struct {
 	client *horizon.Client
-	mu     sync.Mutex
 
 	// Core stats
-	up            *prometheus.Desc
-	status        *prometheus.Desc
-	jobsPerMinute *prometheus.Desc
-	jobsPerHour   *prometheus.Desc
-	processes     *prometheus.Desc
-	recentJobs    *prometheus.Desc
-	pausedMasters *prometheus.Desc
+	up               *prometheus.Desc
+	status           *prometheus.Desc
+	jobsPerMinute    *prometheus.Desc
+	jobsPerHour      *prometheus.Desc
+	processes        *prometheus.Desc
+	recentJobs       *prometheus.Desc
+	pausedMasters    *prometheus.Desc
+	statsFailedJobs  *prometheus.Desc
+	statsWaitSeconds *prometheus.Desc
 
 	// Workload per queue
 	queueLength    *prometheus.Desc
@@ -38,39 +39,42 @@ type Collector struct {
 	jobRuntime    *prometheus.Desc
 
 	// Master / supervisor topology
-	masterStatus        *prometheus.Desc
-	supervisorStatus    *prometheus.Desc
-	supervisorProcesses *prometheus.Desc
+	masterStatus          *prometheus.Desc
+	supervisorStatus      *prometheus.Desc
+	supervisorProcesses   *prometheus.Desc
+	supervisorMaxProcesses *prometheus.Desc
+	supervisorMinProcesses *prometheus.Desc
 
 	// Pending jobs
-	pendingTotal      *prometheus.Desc
-	pendingByQueue    *prometheus.Desc
-	pendingByClass    *prometheus.Desc
+	pendingTotal   *prometheus.Desc
+	pendingByQueue *prometheus.Desc
+	pendingByClass *prometheus.Desc
 
 	// Completed jobs
-	completedTotal    *prometheus.Desc
-	completedByQueue  *prometheus.Desc
-	completedByClass  *prometheus.Desc
+	completedTotal   *prometheus.Desc
+	completedByQueue *prometheus.Desc
+	completedByClass *prometheus.Desc
 
 	// Silenced jobs
-	silencedTotal     *prometheus.Desc
-	silencedByQueue   *prometheus.Desc
-	silencedByClass   *prometheus.Desc
+	silencedTotal   *prometheus.Desc
+	silencedByQueue *prometheus.Desc
+	silencedByClass *prometheus.Desc
 
 	// Failed jobs
-	failedTotal       *prometheus.Desc
-	failedByQueue     *prometheus.Desc
-	failedByClass     *prometheus.Desc
+	failedTotal   *prometheus.Desc
+	failedByQueue *prometheus.Desc
+	failedByClass *prometheus.Desc
 
 	// Monitored tags
 	monitoredTagJobs *prometheus.Desc
 
 	// Batches
-	batchTotal         *prometheus.Desc
-	batchPendingJobs   *prometheus.Desc
-	batchFailedJobs    *prometheus.Desc
-	batchProgress      *prometheus.Desc
-	batchCancelled     *prometheus.Desc
+	batchTotal      *prometheus.Desc
+	batchTotalJobs  *prometheus.Desc
+	batchPendingJobs *prometheus.Desc
+	batchFailedJobs  *prometheus.Desc
+	batchProgress    *prometheus.Desc
+	batchCancelled   *prometheus.Desc
 }
 
 func New(client *horizon.Client) *Collector {
@@ -84,13 +88,15 @@ func New(client *horizon.Client) *Collector {
 	return &Collector{
 		client: client,
 
-		up:            d("", "up", "1 if the Horizon API is reachable, 0 otherwise"),
-		status:        d("", "status", "Horizon status: 1=running, 0=paused/inactive"),
-		jobsPerMinute: d("", "jobs_per_minute", "Jobs processed per minute"),
-		jobsPerHour:   d("", "jobs_per_hour", "Jobs processed per hour"),
-		processes:     d("", "processes", "Total worker processes currently running"),
-		recentJobs:    d("", "recent_jobs_total", "Recent jobs in the monitoring window"),
-		pausedMasters: d("", "paused_masters", "Number of paused master supervisors"),
+		up:               d("", "up", "1 if the Horizon API is reachable, 0 otherwise"),
+		status:           d("", "status", "Horizon status: 1=running, 0=paused/inactive"),
+		jobsPerMinute:    d("", "jobs_per_minute", "Jobs processed per minute"),
+		jobsPerHour:      d("", "jobs_per_hour", "Jobs processed per hour"),
+		processes:        d("", "processes", "Total worker processes currently running"),
+		recentJobs:       d("", "recent_jobs_total", "Recent jobs in the monitoring window"),
+		pausedMasters:    d("", "paused_masters", "Number of paused master supervisors"),
+		statsFailedJobs:  d("stats", "failed_jobs", "Total failed jobs reported by Horizon stats"),
+		statsWaitSeconds: d("stats", "wait_seconds", "Estimated wait time in seconds per queue (from stats)", "queue"),
 
 		queueLength:    d("queue", "length", "Jobs waiting in the queue", "queue"),
 		queueWait:      d("queue", "wait_seconds", "Estimated wait time in seconds", "queue"),
@@ -103,9 +109,11 @@ func New(client *horizon.Client) *Collector {
 		jobThroughput: d("job", "throughput", "Jobs per minute (latest snapshot)", "job"),
 		jobRuntime:    d("job", "runtime_milliseconds", "Average runtime ms (latest snapshot)", "job"),
 
-		masterStatus:        d("master", "status", "Master supervisor status: 1=running, 0=other", "master"),
-		supervisorStatus:    d("supervisor", "status", "Supervisor status: 1=running, 0=other", "master", "supervisor"),
-		supervisorProcesses: d("supervisor", "processes", "Worker processes in supervisor", "master", "supervisor", "queue"),
+		masterStatus:           d("master", "status", "Master supervisor status: 1=running, 0=other", "master", "environment"),
+		supervisorStatus:       d("supervisor", "status", "Supervisor status: 1=running, 0=other", "master", "supervisor"),
+		supervisorProcesses:    d("supervisor", "processes", "Worker processes in supervisor", "master", "supervisor", "queue"),
+		supervisorMaxProcesses: d("supervisor", "max_processes", "Configured max worker processes", "master", "supervisor"),
+		supervisorMinProcesses: d("supervisor", "min_processes", "Configured min worker processes", "master", "supervisor"),
 
 		pendingTotal:   d("pending_jobs", "total", "Total pending jobs"),
 		pendingByQueue: d("pending_jobs", "by_queue", "Pending jobs by queue", "queue"),
@@ -126,10 +134,11 @@ func New(client *horizon.Client) *Collector {
 		monitoredTagJobs: d("monitored_tag", "jobs_total", "Jobs (active + failed) for monitored tag", "tag"),
 
 		batchTotal:       d("batch", "total", "Total number of job batches"),
-		batchPendingJobs: d("batch", "pending_jobs", "Pending jobs in batch", "id", "name"),
-		batchFailedJobs:  d("batch", "failed_jobs", "Failed jobs in batch", "id", "name"),
-		batchProgress:    d("batch", "progress", "Completion progress of batch (0-100)", "id", "name"),
-		batchCancelled:   d("batch", "cancelled", "1 if batch is cancelled, 0 otherwise", "id", "name"),
+		batchTotalJobs:   d("batch", "total_jobs", "Total jobs in batch (summed by name)", "name"),
+		batchPendingJobs: d("batch", "pending_jobs", "Pending jobs in batch (summed by name)", "name"),
+		batchFailedJobs:  d("batch", "failed_jobs", "Failed jobs in batch (summed by name)", "name"),
+		batchProgress:    d("batch", "progress", "Average completion progress of batch 0-100 (by name)", "name"),
+		batchCancelled:   d("batch", "cancelled", "Number of cancelled batches with this name", "name"),
 	}
 }
 
@@ -142,23 +151,21 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 func (c *Collector) allDescs() []*prometheus.Desc {
 	return []*prometheus.Desc{
 		c.up, c.status, c.jobsPerMinute, c.jobsPerHour, c.processes, c.recentJobs, c.pausedMasters,
+		c.statsFailedJobs, c.statsWaitSeconds,
 		c.queueLength, c.queueWait, c.queueProcesses,
 		c.queueThroughput, c.queueRuntime, c.queueWaitSnap,
 		c.jobThroughput, c.jobRuntime,
-		c.masterStatus, c.supervisorStatus, c.supervisorProcesses,
+		c.masterStatus, c.supervisorStatus, c.supervisorProcesses, c.supervisorMaxProcesses, c.supervisorMinProcesses,
 		c.pendingTotal, c.pendingByQueue, c.pendingByClass,
 		c.completedTotal, c.completedByQueue, c.completedByClass,
 		c.silencedTotal, c.silencedByQueue, c.silencedByClass,
 		c.failedTotal, c.failedByQueue, c.failedByClass,
 		c.monitoredTagJobs,
-		c.batchTotal, c.batchPendingJobs, c.batchFailedJobs, c.batchProgress, c.batchCancelled,
+		c.batchTotal, c.batchTotalJobs, c.batchPendingJobs, c.batchFailedJobs, c.batchProgress, c.batchCancelled,
 	}
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	g := func(desc *prometheus.Desc, v float64, lv ...string) {
 		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, lv...)
 	}
@@ -181,6 +188,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	g(c.processes, float64(stats.Processes))
 	g(c.recentJobs, float64(stats.RecentJobs))
 	g(c.pausedMasters, float64(stats.PausedMasters))
+	g(c.statsFailedJobs, float64(stats.FailedJobs))
+	for queue, wait := range stats.WaitTime {
+		g(c.statsWaitSeconds, float64(wait), queue)
+	}
 
 	// ── Workload ─────────────────────────────────────────────────────────────
 	if workload, err := c.client.GetWorkload(); err != nil {
@@ -223,7 +234,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			if m.Status == "running" {
 				isRunning = 1.0
 			}
-			g(c.masterStatus, isRunning, m.Name)
+			g(c.masterStatus, isRunning, m.Name, m.Environment)
 			for _, s := range m.Supervisors {
 				svRunning := 0.0
 				if s.Status == "running" {
@@ -232,6 +243,12 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 				g(c.supervisorStatus, svRunning, m.Name, s.Name)
 				for queue, count := range s.Processes {
 					g(c.supervisorProcesses, float64(count), m.Name, s.Name, queue)
+				}
+				if maxP, err := strconv.Atoi(s.Options.MaxProcesses); err == nil {
+					g(c.supervisorMaxProcesses, float64(maxP), m.Name, s.Name)
+				}
+				if minP, err := strconv.Atoi(s.Options.MinProcesses); err == nil {
+					g(c.supervisorMinProcesses, float64(minP), m.Name, s.Name)
 				}
 			}
 		}
@@ -302,16 +319,41 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	if batches, err := c.client.GetBatches(); err != nil {
 		log.Printf("error fetching batches: %v", err)
 	} else {
-		g(c.batchTotal, float64(len(batches)))
+		type agg struct {
+			pending   int64
+			failed    int64
+			total     int64
+			progress  float64
+			count     int64
+			cancelled int64
+		}
+		byName := make(map[string]*agg, len(batches))
 		for _, b := range batches {
-			cancelled := 0.0
-			if b.CancelledAt != nil {
-				cancelled = 1.0
+			a := byName[b.Name]
+			if a == nil {
+				a = &agg{}
+				byName[b.Name] = a
 			}
-			g(c.batchPendingJobs, float64(b.PendingJobs), b.ID, b.Name)
-			g(c.batchFailedJobs, float64(b.FailedJobs), b.ID, b.Name)
-			g(c.batchProgress, b.Progress, b.ID, b.Name)
-			g(c.batchCancelled, cancelled, b.ID, b.Name)
+			a.pending += b.PendingJobs
+			a.failed += b.FailedJobs
+			a.total += b.TotalJobs
+			a.progress += b.Progress
+			a.count++
+			if b.CancelledAt != nil {
+				a.cancelled++
+			}
+		}
+		g(c.batchTotal, float64(len(batches)))
+		for name, a := range byName {
+			avgProgress := 0.0
+			if a.count > 0 {
+				avgProgress = a.progress / float64(a.count)
+			}
+			g(c.batchTotalJobs, float64(a.total), name)
+			g(c.batchPendingJobs, float64(a.pending), name)
+			g(c.batchFailedJobs, float64(a.failed), name)
+			g(c.batchProgress, avgProgress, name)
+			g(c.batchCancelled, float64(a.cancelled), name)
 		}
 	}
 }

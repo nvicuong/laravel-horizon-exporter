@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 
@@ -13,7 +14,8 @@ import (
 
 func main() {
 	var (
-		listenAddr    = flag.String("web.listen-address", ":9888", "Address to listen on for metrics")
+		listenIP      = flag.String("web.listen-ip", "", "IP address to listen on (empty = all interfaces)")
+		listenPort    = flag.Int("web.listen-port", 9888, "Port to listen on for metrics")
 		metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics")
 		horizonURL    = flag.String("horizon.url", "http://localhost", "Base URL of the Laravel application")
 		horizonToken  = flag.String("horizon.token", "", "Bearer token for Horizon API authentication")
@@ -24,6 +26,8 @@ func main() {
 	if *horizonURL == "" {
 		log.Fatal("--horizon.url is required")
 	}
+
+	listenAddr := fmt.Sprintf("%s:%d", *listenIP, *listenPort)
 
 	client := horizon.NewClient(*horizonURL, *horizonToken, *skipTLSVerify)
 	col := collector.New(client)
@@ -46,8 +50,8 @@ func main() {
 		w.Write([]byte("OK"))
 	})
 
-	log.Printf("Starting Horizon exporter on %s, scraping %s", *listenAddr, *horizonURL)
-	if err := http.ListenAndServe(*listenAddr, nil); err != nil {
+	log.Printf("Starting Horizon exporter on %s, scraping %s", listenAddr, *horizonURL)
+	if err := http.ListenAndServe(listenAddr, nil); err != nil {
 		log.Fatalf("Error starting HTTP server: %v", err)
 	}
 }
