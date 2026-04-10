@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,6 +17,8 @@ const (
 	jobPageSize      = 50
 	metricFanoutLimit = 10
 )
+
+var ErrEndpointUnavailable = fmt.Errorf("endpoint not available in this Horizon version")
 
 type Client struct {
 	baseURL    string
@@ -55,6 +58,11 @@ func (c *Client) get(path string, out interface{}) error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("horizon API returned status %d for %s", resp.StatusCode, path)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/json") && !strings.Contains(ct, "text/json") {
+		return ErrEndpointUnavailable
 	}
 
 	body, err := io.ReadAll(resp.Body)

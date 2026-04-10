@@ -205,3 +205,6 @@ Horizon's metrics API requires one HTTP request per queue/job class. With many q
 ## Contributing
 
 Contributions are welcome. Please open an issue before starting any significant work, then submit a pull request against `main`.
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o horizon-exporter-linux-amd64
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o horizon-exporter-linux-arm64

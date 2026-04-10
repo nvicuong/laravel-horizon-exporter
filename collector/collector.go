@@ -1,8 +1,8 @@
 package collector
 
 import (
+	"errors"
 	"log"
-	"strconv"
 
 	"github.com/horizon-exporter/horizon"
 	"github.com/prometheus/client_golang/prometheus"
@@ -14,15 +14,21 @@ type Collector struct {
 	client *horizon.Client
 
 	// Core stats
-	up               *prometheus.Desc
-	status           *prometheus.Desc
-	jobsPerMinute    *prometheus.Desc
-	jobsPerHour      *prometheus.Desc
-	processes        *prometheus.Desc
-	recentJobs       *prometheus.Desc
-	pausedMasters    *prometheus.Desc
-	statsFailedJobs  *prometheus.Desc
-	statsWaitSeconds *prometheus.Desc
+	up             *prometheus.Desc
+	status         *prometheus.Desc
+	jobsPerMinute  *prometheus.Desc
+	processes      *prometheus.Desc
+	recentJobs     *prometheus.Desc
+	recentlyFailed *prometheus.Desc
+
+	// Stats periods (window sizes)
+	recentJobsPeriod     *prometheus.Desc
+	recentlyFailedPeriod *prometheus.Desc
+
+	// Stats wait & hottest queue info
+	statsWaitSeconds        *prometheus.Desc
+	statsMaxRuntimeQueue    *prometheus.Desc
+	statsMaxThroughputQueue *prometheus.Desc
 
 	// Workload per queue
 	queueLength    *prometheus.Desc
@@ -38,12 +44,17 @@ type Collector struct {
 	jobThroughput *prometheus.Desc
 	jobRuntime    *prometheus.Desc
 
-	// Master / supervisor topology
-	masterStatus          *prometheus.Desc
-	supervisorStatus      *prometheus.Desc
-	supervisorProcesses   *prometheus.Desc
+	// Master topology
+	masterStatus *prometheus.Desc
+
+	// Supervisor topology
+	supervisorStatus       *prometheus.Desc
+	supervisorProcesses    *prometheus.Desc
 	supervisorMaxProcesses *prometheus.Desc
 	supervisorMinProcesses *prometheus.Desc
+	supervisorTimeout      *prometheus.Desc
+	supervisorMaxTries     *prometheus.Desc
+	supervisorMemory       *prometheus.Desc
 
 	// Pending jobs
 	pendingTotal   *prometheus.Desc
@@ -69,8 +80,8 @@ type Collector struct {
 	monitoredTagJobs *prometheus.Desc
 
 	// Batches
-	batchTotal      *prometheus.Desc
-	batchTotalJobs  *prometheus.Desc
+	batchTotal       *prometheus.Desc
+	batchTotalJobs   *prometheus.Desc
 	batchPendingJobs *prometheus.Desc
 	batchFailedJobs  *prometheus.Desc
 	batchProgress    *prometheus.Desc
@@ -88,15 +99,19 @@ func New(client *horizon.Client) *Collector {
 	return &Collector{
 		client: client,
 
-		up:               d("", "up", "1 if the Horizon API is reachable, 0 otherwise"),
-		status:           d("", "status", "Horizon status: 1=running, 0=paused/inactive"),
-		jobsPerMinute:    d("", "jobs_per_minute", "Jobs processed per minute"),
-		jobsPerHour:      d("", "jobs_per_hour", "Jobs processed per hour"),
-		processes:        d("", "processes", "Total worker processes currently running"),
-		recentJobs:       d("", "recent_jobs_total", "Recent jobs in the monitoring window"),
-		pausedMasters:    d("", "paused_masters", "Number of paused master supervisors"),
-		statsFailedJobs:  d("stats", "failed_jobs", "Total failed jobs reported by Horizon stats"),
-		statsWaitSeconds: d("stats", "wait_seconds", "Estimated wait time in seconds per queue (from stats)", "queue"),
+		up:             d("", "up", "1 if the Horizon API is reachable, 0 otherwise"),
+		status:         d("", "status", "Horizon status: 1=running, 0=paused/inactive"),
+		jobsPerMinute:  d("", "jobs_per_minute", "Jobs processed per minute"),
+		processes:      d("", "processes", "Total worker processes currently running"),
+		recentJobs:     d("", "recent_jobs_total", "Recent jobs within the recentJobs period window"),
+		recentlyFailed: d("", "recently_failed_total", "Recently failed jobs within the recentlyFailed period window"),
+
+		recentJobsPeriod:     d("", "recent_jobs_period_minutes", "Time window in minutes for the recentJobs counter"),
+		recentlyFailedPeriod: d("", "recently_failed_period_minutes", "Time window in minutes for the recentlyFailed counter"),
+
+		statsWaitSeconds:        d("stats", "wait_seconds", "Estimated wait time in seconds per queue", "queue"),
+		statsMaxRuntimeQueue:    d("stats", "max_runtime_queue_info", "Queue with the highest average job runtime (1=current)", "queue"),
+		statsMaxThroughputQueue: d("stats", "max_throughput_queue_info", "Queue with the highest throughput (1=current)", "queue"),
 
 		queueLength:    d("queue", "length", "Jobs waiting in the queue", "queue"),
 		queueWait:      d("queue", "wait_seconds", "Estimated wait time in seconds", "queue"),
@@ -109,11 +124,15 @@ func New(client *horizon.Client) *Collector {
 		jobThroughput: d("job", "throughput", "Jobs per minute (latest snapshot)", "job"),
 		jobRuntime:    d("job", "runtime_milliseconds", "Average runtime ms (latest snapshot)", "job"),
 
-		masterStatus:           d("master", "status", "Master supervisor status: 1=running, 0=other", "master", "environment"),
+		masterStatus: d("master", "status", "Master supervisor status: 1=running, 0=other", "master"),
+
 		supervisorStatus:       d("supervisor", "status", "Supervisor status: 1=running, 0=other", "master", "supervisor"),
-		supervisorProcesses:    d("supervisor", "processes", "Worker processes in supervisor", "master", "supervisor", "queue"),
+		supervisorProcesses:    d("supervisor", "processes", "Worker processes in supervisor per queue", "master", "supervisor", "queue"),
 		supervisorMaxProcesses: d("supervisor", "max_processes", "Configured max worker processes", "master", "supervisor"),
 		supervisorMinProcesses: d("supervisor", "min_processes", "Configured min worker processes", "master", "supervisor"),
+		supervisorTimeout:      d("supervisor", "timeout_seconds", "Configured job timeout in seconds", "master", "supervisor"),
+		supervisorMaxTries:     d("supervisor", "max_tries", "Configured max job attempts", "master", "supervisor"),
+		supervisorMemory:       d("supervisor", "memory_limit_megabytes", "Configured worker memory limit in MB", "master", "supervisor"),
 
 		pendingTotal:   d("pending_jobs", "total", "Total pending jobs"),
 		pendingByQueue: d("pending_jobs", "by_queue", "Pending jobs by queue", "queue"),
@@ -150,12 +169,16 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 
 func (c *Collector) allDescs() []*prometheus.Desc {
 	return []*prometheus.Desc{
-		c.up, c.status, c.jobsPerMinute, c.jobsPerHour, c.processes, c.recentJobs, c.pausedMasters,
-		c.statsFailedJobs, c.statsWaitSeconds,
+		c.up, c.status, c.jobsPerMinute, c.processes, c.recentJobs, c.recentlyFailed,
+		c.recentJobsPeriod, c.recentlyFailedPeriod,
+		c.statsWaitSeconds, c.statsMaxRuntimeQueue, c.statsMaxThroughputQueue,
 		c.queueLength, c.queueWait, c.queueProcesses,
 		c.queueThroughput, c.queueRuntime, c.queueWaitSnap,
 		c.jobThroughput, c.jobRuntime,
-		c.masterStatus, c.supervisorStatus, c.supervisorProcesses, c.supervisorMaxProcesses, c.supervisorMinProcesses,
+		c.masterStatus,
+		c.supervisorStatus, c.supervisorProcesses,
+		c.supervisorMaxProcesses, c.supervisorMinProcesses,
+		c.supervisorTimeout, c.supervisorMaxTries, c.supervisorMemory,
 		c.pendingTotal, c.pendingByQueue, c.pendingByClass,
 		c.completedTotal, c.completedByQueue, c.completedByClass,
 		c.silencedTotal, c.silencedByQueue, c.silencedByClass,
@@ -173,7 +196,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	// ── Stats ────────────────────────────────────────────────────────────────
 	stats, err := c.client.GetStats()
 	if err != nil {
-		log.Printf("error fetching stats: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching stats: %v", err)
+		}
 		g(c.up, 0)
 		return
 	}
@@ -184,18 +209,30 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	g(c.status, running)
 	g(c.jobsPerMinute, stats.JobsPerMinute)
-	g(c.jobsPerHour, stats.JobsPerHour)
 	g(c.processes, float64(stats.Processes))
 	g(c.recentJobs, float64(stats.RecentJobs))
-	g(c.pausedMasters, float64(stats.PausedMasters))
-	g(c.statsFailedJobs, float64(stats.FailedJobs))
+	g(c.recentlyFailed, float64(stats.RecentlyFailed))
+	if stats.Periods.RecentJobs > 0 {
+		g(c.recentJobsPeriod, float64(stats.Periods.RecentJobs))
+	}
+	if stats.Periods.RecentlyFailed > 0 {
+		g(c.recentlyFailedPeriod, float64(stats.Periods.RecentlyFailed))
+	}
 	for queue, wait := range stats.WaitTime {
 		g(c.statsWaitSeconds, float64(wait), queue)
+	}
+	if stats.QueueWithMaxRuntime != "" {
+		g(c.statsMaxRuntimeQueue, 1, stats.QueueWithMaxRuntime)
+	}
+	if stats.QueueWithMaxThroughput != "" {
+		g(c.statsMaxThroughputQueue, 1, stats.QueueWithMaxThroughput)
 	}
 
 	// ── Workload ─────────────────────────────────────────────────────────────
 	if workload, err := c.client.GetWorkload(); err != nil {
-		log.Printf("error fetching workload: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching workload: %v", err)
+		}
 	} else {
 		for _, w := range workload {
 			g(c.queueLength, float64(w.Length), w.Name)
@@ -206,7 +243,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Queue metric snapshots ───────────────────────────────────────────────
 	if qm, err := c.client.GetQueueMetrics(); err != nil {
-		log.Printf("error fetching queue metrics: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching queue metrics: %v", err)
+		}
 	} else {
 		for queue, snap := range qm {
 			g(c.queueThroughput, snap.Throughput, queue)
@@ -217,7 +256,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Job class metric snapshots ───────────────────────────────────────────
 	if jm, err := c.client.GetJobMetrics(); err != nil {
-		log.Printf("error fetching job metrics: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching job metrics: %v", err)
+		}
 	} else {
 		for job, snap := range jm {
 			g(c.jobThroughput, snap.Throughput, job)
@@ -227,14 +268,16 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Masters / supervisors ────────────────────────────────────────────────
 	if masters, err := c.client.GetMasters(); err != nil {
-		log.Printf("error fetching masters: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching masters: %v", err)
+		}
 	} else {
 		for _, m := range masters {
 			isRunning := 0.0
 			if m.Status == "running" {
 				isRunning = 1.0
 			}
-			g(c.masterStatus, isRunning, m.Name, m.Environment)
+			g(c.masterStatus, isRunning, m.Name)
 			for _, s := range m.Supervisors {
 				svRunning := 0.0
 				if s.Status == "running" {
@@ -244,11 +287,16 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 				for queue, count := range s.Processes {
 					g(c.supervisorProcesses, float64(count), m.Name, s.Name, queue)
 				}
-				if maxP, err := strconv.Atoi(s.Options.MaxProcesses); err == nil {
-					g(c.supervisorMaxProcesses, float64(maxP), m.Name, s.Name)
+				g(c.supervisorMaxProcesses, float64(s.Options.MaxProcesses), m.Name, s.Name)
+				g(c.supervisorMinProcesses, float64(s.Options.MinProcesses), m.Name, s.Name)
+				if s.Options.Timeout > 0 {
+					g(c.supervisorTimeout, float64(s.Options.Timeout), m.Name, s.Name)
 				}
-				if minP, err := strconv.Atoi(s.Options.MinProcesses); err == nil {
-					g(c.supervisorMinProcesses, float64(minP), m.Name, s.Name)
+				if s.Options.Tries > 0 {
+					g(c.supervisorMaxTries, float64(s.Options.Tries), m.Name, s.Name)
+				}
+				if s.Options.Memory > 0 {
+					g(c.supervisorMemory, float64(s.Options.Memory), m.Name, s.Name)
 				}
 			}
 		}
@@ -256,7 +304,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Pending jobs ─────────────────────────────────────────────────────────
 	if counts, err := c.client.GetPendingJobCounts(); err != nil {
-		log.Printf("error fetching pending jobs: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching pending jobs: %v", err)
+		}
 	} else {
 		g(c.pendingTotal, float64(counts.Total))
 		for q, n := range counts.ByQueue {
@@ -269,7 +319,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Completed jobs ───────────────────────────────────────────────────────
 	if counts, err := c.client.GetCompletedJobCounts(); err != nil {
-		log.Printf("error fetching completed jobs: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching completed jobs: %v", err)
+		}
 	} else {
 		g(c.completedTotal, float64(counts.Total))
 		for q, n := range counts.ByQueue {
@@ -282,7 +334,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Silenced jobs ────────────────────────────────────────────────────────
 	if counts, err := c.client.GetSilencedJobCounts(); err != nil {
-		log.Printf("error fetching silenced jobs: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching silenced jobs: %v", err)
+		}
 	} else {
 		g(c.silencedTotal, float64(counts.Total))
 		for q, n := range counts.ByQueue {
@@ -295,7 +349,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Failed jobs ──────────────────────────────────────────────────────────
 	if counts, err := c.client.GetFailedJobCounts(); err != nil {
-		log.Printf("error fetching failed jobs: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching failed jobs: %v", err)
+		}
 	} else {
 		g(c.failedTotal, float64(counts.Total))
 		for q, n := range counts.ByQueue {
@@ -308,7 +364,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Monitored tags ───────────────────────────────────────────────────────
 	if tags, err := c.client.GetMonitoredTags(); err != nil {
-		log.Printf("error fetching monitored tags: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching monitored tags: %v", err)
+		}
 	} else {
 		for _, t := range tags {
 			g(c.monitoredTagJobs, float64(t.Count), t.Tag)
@@ -317,7 +375,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Batches ──────────────────────────────────────────────────────────────
 	if batches, err := c.client.GetBatches(); err != nil {
-		log.Printf("error fetching batches: %v", err)
+		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+			log.Printf("error fetching batches: %v", err)
+		}
 	} else {
 		type agg struct {
 			pending   int64

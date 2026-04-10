@@ -1,18 +1,52 @@
 package horizon
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strconv"
+)
+
+type FlexInt int64
+
+func (f *FlexInt) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		if s == "" {
+			*f = 0
+			return nil
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return err
+		}
+		*f = FlexInt(n)
+		return nil
+	}
+	var n int64
+	if err := json.Unmarshal(data, &n); err != nil {
+		return err
+	}
+	*f = FlexInt(n)
+	return nil
+}
+
+type StatsPeriods struct {
+	RecentJobs     int `json:"recentJobs"`
+	RecentlyFailed int `json:"recentlyFailed"`
+}
 
 type Stats struct {
 	Status                 string           `json:"status"`
 	JobsPerMinute          float64          `json:"jobsPerMinute"`
-	JobsPerHour            float64          `json:"jobsPerHour"`
-	FailedJobs             int64            `json:"failedJobs"`
+	RecentlyFailed         int64            `json:"recentlyFailed"`
 	Processes              int              `json:"processes"`
 	WaitTime               map[string]int64 `json:"wait"`
 	QueueWithMaxRuntime    string           `json:"queueWithMaxRuntime"`
 	QueueWithMaxThroughput string           `json:"queueWithMaxThroughput"`
 	RecentJobs             int64            `json:"recentJobs"`
-	PausedMasters          int              `json:"pausedMasters"`
+	Periods                StatsPeriods     `json:"periods"`
 }
 
 type WorkloadItem struct {
@@ -24,13 +58,11 @@ type WorkloadItem struct {
 
 type MasterSupervisor struct {
 	Name        string       `json:"name"`
-	Environment string       `json:"environment"`
 	PID         string       `json:"pid"`
 	Status      string       `json:"status"`
 	Supervisors []Supervisor `json:"supervisors"`
 }
 
-// ProcessMap handles both {"redis:queue": 1} and [] (inactive supervisors).
 type ProcessMap map[string]int
 
 func (p *ProcessMap) UnmarshalJSON(data []byte) error {
@@ -48,22 +80,23 @@ func (p *ProcessMap) UnmarshalJSON(data []byte) error {
 
 type Supervisor struct {
 	Name      string            `json:"name"`
+	PID       string            `json:"pid"`
 	Status    string            `json:"status"`
 	Processes ProcessMap        `json:"processes"`
 	Options   SupervisorOptions `json:"options"`
 }
 
 type SupervisorOptions struct {
-	Queue        string `json:"queue"`
-	Connection   string `json:"connection"`
-	Balance      string `json:"balance"`
-	MaxProcesses string `json:"maxProcesses"`
-	MinProcesses string `json:"minProcesses"`
-	Timeout      string `json:"timeout"`
-	Tries        string `json:"maxTries"`
+	Queue        string  `json:"queue"`
+	Connection   string  `json:"connection"`
+	Balance      string  `json:"balance"`
+	MaxProcesses FlexInt `json:"maxProcesses"`
+	MinProcesses FlexInt `json:"minProcesses"`
+	Timeout      FlexInt `json:"timeout"`
+	Tries        FlexInt `json:"maxTries"`
+	Memory       FlexInt `json:"memory"`
 }
 
-// JobEntry is a single job from the pending/completed/silenced/failed list endpoints.
 type JobEntry struct {
 	ID         string `json:"id"`
 	Connection string `json:"connection"`
@@ -78,7 +111,6 @@ type JobListResponse struct {
 	Total int64      `json:"total"`
 }
 
-// JobCounts holds per-queue and per-class counts aggregated from a job list.
 type JobCounts struct {
 	Total   int64
 	ByQueue map[string]int64
