@@ -41,12 +41,42 @@ The exporter connects directly to the Horizon HTTP API and exposes metrics via H
 | `--horizon.url` | Base URL of the Laravel application **(required)** | `http://localhost` |
 | `--horizon.token` | Bearer token for Horizon API authentication | `` |
 | `--horizon.tls-skip-verify` | Skip TLS certificate verification | `false` |
+| `--horizon.endpoint.exclude` | Comma-separated endpoints to skip (repeatable) | `` (none) |
+
+### Horizon API endpoints
+
+The exporter calls the following Horizon API endpoints on every scrape. Use `--horizon.endpoint.exclude` to disable any of them.
+
+| Endpoint key | Horizon API path | Metrics produced |
+|---|---|---|
+| `stats` | `/horizon/api/stats` | `horizon_up`, `horizon_status`, `horizon_jobs_per_minute`, `horizon_processes`, `horizon_recent_jobs_total`, `horizon_recently_failed_total`, `horizon_recent_jobs_period_minutes`, `horizon_recently_failed_period_minutes`, `horizon_stats_wait_seconds`, `horizon_stats_max_runtime_queue_info`, `horizon_stats_max_throughput_queue_info` |
+| `workload` | `/horizon/api/workload` | `horizon_queue_length`, `horizon_queue_wait_seconds`, `horizon_queue_processes` |
+| `masters` | `/horizon/api/masters` | `horizon_master_status`, `horizon_supervisor_status`, `horizon_supervisor_processes`, `horizon_supervisor_max_processes`, `horizon_supervisor_min_processes`, `horizon_supervisor_timeout_seconds`, `horizon_supervisor_max_tries`, `horizon_supervisor_memory_limit_megabytes` |
+| `jobs/pending` | `/horizon/api/jobs/pending` | `horizon_pending_jobs_total`, `horizon_pending_jobs_by_queue`, `horizon_pending_jobs_by_class` |
+| `jobs/completed` | `/horizon/api/jobs/completed` | `horizon_completed_jobs_total`, `horizon_completed_jobs_by_queue`, `horizon_completed_jobs_by_class` |
+| `jobs/silenced` | `/horizon/api/jobs/silenced` | `horizon_silenced_jobs_total`, `horizon_silenced_jobs_by_queue`, `horizon_silenced_jobs_by_class` |
+| `jobs/failed` | `/horizon/api/jobs/failed` | `horizon_failed_jobs_total`, `horizon_failed_jobs_by_queue`, `horizon_failed_jobs_by_class` |
+| `metrics/queues` | `/horizon/api/metrics/queues` + per-queue | `horizon_queue_throughput`, `horizon_queue_runtime_milliseconds`, `horizon_queue_wait_time_seconds` |
+| `metrics/jobs` | `/horizon/api/metrics/jobs` + per-class | `horizon_job_throughput`, `horizon_job_runtime_milliseconds` |
+| `batches` | `/horizon/api/batches` | `horizon_batch_total`, `horizon_batch_total_jobs`, `horizon_batch_pending_jobs`, `horizon_batch_failed_jobs`, `horizon_batch_progress`, `horizon_batch_cancelled` |
+| `monitoring` | `/horizon/api/monitoring` | `horizon_monitored_tag_jobs_total` |
+
+> **Note:** `stats` cannot be meaningfully excluded — it is the primary health check endpoint and its availability controls `horizon_up`. Excluding it will suppress all stats-derived metrics but `horizon_up` will still emit `1`.
 
 ### CLI Examples
 
+- Build binaries:
+  ```
+  # Build Linux AMD64 binary
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o horizon-exporter-linux-amd64
+
+  # Build Linux ARM64 binary
+  CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o horizon-exporter-linux-arm64
+  ```
+
 - Run with defaults against a local Laravel app:
   ```
-  ./horizon-exporter --horizon.url=http://localhost
+  ./horizon-exporter-linux-amd64 --horizon.url=http://localhost
   ```
 
 - Run on a specific IP and port:
@@ -68,17 +98,60 @@ The exporter connects directly to the Horizon HTTP API and exposes metrics via H
     --horizon.tls-skip-verify
   ```
 
+- Exclude expensive paginated job endpoints (reduces scrape time and Horizon load):
+  ```
+  ./horizon-exporter --horizon.url=https://myapp.example.com \
+    --horizon.endpoint.exclude=jobs/pending,jobs/completed,jobs/silenced
+  ```
+
+- Exclude multiple endpoints using repeated flags:
+  ```
+  ./horizon-exporter --horizon.url=https://myapp.example.com \
+    --horizon.endpoint.exclude=batches \
+    --horizon.endpoint.exclude=monitoring \
+    --horizon.endpoint.exclude=metrics/queues \
+    --horizon.endpoint.exclude=metrics/jobs
+  ```
+
+- Minimal mode — only core stats, queue workload, and master topology:
+  ```
+  ./horizon-exporter-linux-amd64 --horizon.url=https://myapp.example.com \
+    --horizon.endpoint.exclude=jobs/pending,jobs/completed,jobs/silenced,jobs/failed,metrics/queues,metrics/jobs,batches,monitoring
+  ```
+
 ### Docker Examples
 
-```
-docker build -t horizon-exporter .
+- Build the image:
+  ```
+  docker build -t horizon-exporter .
+  ```
 
-docker run -it --rm \
-  -e HORIZON_URL="http://myapp.internal" \
-  -p 9888:9888 \
-  horizon-exporter \
-  --horizon.url=http://myapp.internal
-```
+- Run with a remote Horizon URL:
+  ```
+  docker run -d --restart=unless-stopped \
+    -p 9888:9888 \
+    horizon-exporter \
+    --horizon.url=https://myapp.example.com
+  ```
+
+- Run with authentication and TLS skip:
+  ```
+  docker run -d --restart=unless-stopped \
+    -p 9888:9888 \
+    horizon-exporter \
+    --horizon.url=https://myapp.example.com \
+    --horizon.token=my-secret-token \
+    --horizon.tls-skip-verify
+  ```
+
+- Run in minimal mode (exclude expensive endpoints):
+  ```
+  docker run -d --restart=unless-stopped \
+    -p 9888:9888 \
+    horizon-exporter \
+    --horizon.url=https://myapp.example.com \
+    --horizon.endpoint.exclude=jobs/pending,jobs/completed,jobs/silenced,jobs/failed,metrics/queues,metrics/jobs,batches,monitoring
+  ```
 
 ## Metrics collected
 
@@ -205,6 +278,3 @@ Horizon's metrics API requires one HTTP request per queue/job class. With many q
 ## Contributing
 
 Contributions are welcome. Please open an issue before starting any significant work, then submit a pull request against `main`.
-
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o horizon-exporter-linux-amd64
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o horizon-exporter-linux-arm64

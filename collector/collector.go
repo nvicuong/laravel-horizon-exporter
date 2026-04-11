@@ -11,7 +11,8 @@ import (
 const namespace = "horizon"
 
 type Collector struct {
-	client *horizon.Client
+	client   *horizon.Client
+	excluded map[string]bool
 
 	// Core stats
 	up             *prometheus.Desc
@@ -88,7 +89,7 @@ type Collector struct {
 	batchCancelled   *prometheus.Desc
 }
 
-func New(client *horizon.Client) *Collector {
+func New(client *horizon.Client, excluded map[string]bool) *Collector {
 	d := func(subsystem, name, help string, labels ...string) *prometheus.Desc {
 		return prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, subsystem, name),
@@ -97,7 +98,8 @@ func New(client *horizon.Client) *Collector {
 	}
 
 	return &Collector{
-		client: client,
+		client:   client,
+		excluded: excluded,
 
 		up:             d("", "up", "1 if the Horizon API is reachable, 0 otherwise"),
 		status:         d("", "status", "Horizon status: 1=running, 0=paused/inactive"),
@@ -161,6 +163,10 @@ func New(client *horizon.Client) *Collector {
 	}
 }
 
+func (c *Collector) skip(endpoint string) bool {
+	return c.excluded[endpoint]
+}
+
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range c.allDescs() {
 		ch <- d
@@ -194,226 +200,250 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	// ── Stats ────────────────────────────────────────────────────────────────
-	stats, err := c.client.GetStats()
-	if err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching stats: %v", err)
+	if !c.skip("stats") {
+		stats, err := c.client.GetStats()
+		if err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching stats: %v", err)
+			}
+			g(c.up, 0)
+			return
 		}
-		g(c.up, 0)
-		return
-	}
-	g(c.up, 1)
-	running := 0.0
-	if stats.Status == "running" {
-		running = 1.0
-	}
-	g(c.status, running)
-	g(c.jobsPerMinute, stats.JobsPerMinute)
-	g(c.processes, float64(stats.Processes))
-	g(c.recentJobs, float64(stats.RecentJobs))
-	g(c.recentlyFailed, float64(stats.RecentlyFailed))
-	if stats.Periods.RecentJobs > 0 {
-		g(c.recentJobsPeriod, float64(stats.Periods.RecentJobs))
-	}
-	if stats.Periods.RecentlyFailed > 0 {
-		g(c.recentlyFailedPeriod, float64(stats.Periods.RecentlyFailed))
-	}
-	for queue, wait := range stats.WaitTime {
-		g(c.statsWaitSeconds, float64(wait), queue)
-	}
-	if stats.QueueWithMaxRuntime != "" {
-		g(c.statsMaxRuntimeQueue, 1, stats.QueueWithMaxRuntime)
-	}
-	if stats.QueueWithMaxThroughput != "" {
-		g(c.statsMaxThroughputQueue, 1, stats.QueueWithMaxThroughput)
+		g(c.up, 1)
+		running := 0.0
+		if stats.Status == "running" {
+			running = 1.0
+		}
+		g(c.status, running)
+		g(c.jobsPerMinute, stats.JobsPerMinute)
+		g(c.processes, float64(stats.Processes))
+		g(c.recentJobs, float64(stats.RecentJobs))
+		g(c.recentlyFailed, float64(stats.RecentlyFailed))
+		if stats.Periods.RecentJobs > 0 {
+			g(c.recentJobsPeriod, float64(stats.Periods.RecentJobs))
+		}
+		if stats.Periods.RecentlyFailed > 0 {
+			g(c.recentlyFailedPeriod, float64(stats.Periods.RecentlyFailed))
+		}
+		for queue, wait := range stats.WaitTime {
+			g(c.statsWaitSeconds, float64(wait), queue)
+		}
+		if stats.QueueWithMaxRuntime != "" {
+			g(c.statsMaxRuntimeQueue, 1, stats.QueueWithMaxRuntime)
+		}
+		if stats.QueueWithMaxThroughput != "" {
+			g(c.statsMaxThroughputQueue, 1, stats.QueueWithMaxThroughput)
+		}
+	} else {
+		g(c.up, 1)
 	}
 
 	// ── Workload ─────────────────────────────────────────────────────────────
-	if workload, err := c.client.GetWorkload(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching workload: %v", err)
-		}
-	} else {
-		for _, w := range workload {
-			g(c.queueLength, float64(w.Length), w.Name)
-			g(c.queueWait, float64(w.Wait), w.Name)
-			g(c.queueProcesses, float64(w.Processes), w.Name)
+	if !c.skip("workload") {
+		if workload, err := c.client.GetWorkload(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching workload: %v", err)
+			}
+		} else {
+			for _, w := range workload {
+				g(c.queueLength, float64(w.Length), w.Name)
+				g(c.queueWait, float64(w.Wait), w.Name)
+				g(c.queueProcesses, float64(w.Processes), w.Name)
+			}
 		}
 	}
 
 	// ── Queue metric snapshots ───────────────────────────────────────────────
-	if qm, err := c.client.GetQueueMetrics(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching queue metrics: %v", err)
-		}
-	} else {
-		for queue, snap := range qm {
-			g(c.queueThroughput, snap.Throughput, queue)
-			g(c.queueRuntime, snap.Runtime, queue)
-			g(c.queueWaitSnap, float64(snap.Wait), queue)
+	if !c.skip("metrics/queues") {
+		if qm, err := c.client.GetQueueMetrics(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching queue metrics: %v", err)
+			}
+		} else {
+			for queue, snap := range qm {
+				g(c.queueThroughput, snap.Throughput, queue)
+				g(c.queueRuntime, snap.Runtime, queue)
+				g(c.queueWaitSnap, float64(snap.Wait), queue)
+			}
 		}
 	}
 
 	// ── Job class metric snapshots ───────────────────────────────────────────
-	if jm, err := c.client.GetJobMetrics(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching job metrics: %v", err)
-		}
-	} else {
-		for job, snap := range jm {
-			g(c.jobThroughput, snap.Throughput, job)
-			g(c.jobRuntime, snap.Runtime, job)
+	if !c.skip("metrics/jobs") {
+		if jm, err := c.client.GetJobMetrics(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching job metrics: %v", err)
+			}
+		} else {
+			for job, snap := range jm {
+				g(c.jobThroughput, snap.Throughput, job)
+				g(c.jobRuntime, snap.Runtime, job)
+			}
 		}
 	}
 
 	// ── Masters / supervisors ────────────────────────────────────────────────
-	if masters, err := c.client.GetMasters(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching masters: %v", err)
-		}
-	} else {
-		for _, m := range masters {
-			isRunning := 0.0
-			if m.Status == "running" {
-				isRunning = 1.0
+	if !c.skip("masters") {
+		if masters, err := c.client.GetMasters(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching masters: %v", err)
 			}
-			g(c.masterStatus, isRunning, m.Name)
-			for _, s := range m.Supervisors {
-				svRunning := 0.0
-				if s.Status == "running" {
-					svRunning = 1.0
+		} else {
+			for _, m := range masters {
+				isRunning := 0.0
+				if m.Status == "running" {
+					isRunning = 1.0
 				}
-				g(c.supervisorStatus, svRunning, m.Name, s.Name)
-				for queue, count := range s.Processes {
-					g(c.supervisorProcesses, float64(count), m.Name, s.Name, queue)
-				}
-				g(c.supervisorMaxProcesses, float64(s.Options.MaxProcesses), m.Name, s.Name)
-				g(c.supervisorMinProcesses, float64(s.Options.MinProcesses), m.Name, s.Name)
-				if s.Options.Timeout > 0 {
-					g(c.supervisorTimeout, float64(s.Options.Timeout), m.Name, s.Name)
-				}
-				if s.Options.Tries > 0 {
-					g(c.supervisorMaxTries, float64(s.Options.Tries), m.Name, s.Name)
-				}
-				if s.Options.Memory > 0 {
-					g(c.supervisorMemory, float64(s.Options.Memory), m.Name, s.Name)
+				g(c.masterStatus, isRunning, m.Name)
+				for _, s := range m.Supervisors {
+					svRunning := 0.0
+					if s.Status == "running" {
+						svRunning = 1.0
+					}
+					g(c.supervisorStatus, svRunning, m.Name, s.Name)
+					for queue, count := range s.Processes {
+						g(c.supervisorProcesses, float64(count), m.Name, s.Name, queue)
+					}
+					g(c.supervisorMaxProcesses, float64(s.Options.MaxProcesses), m.Name, s.Name)
+					g(c.supervisorMinProcesses, float64(s.Options.MinProcesses), m.Name, s.Name)
+					if s.Options.Timeout > 0 {
+						g(c.supervisorTimeout, float64(s.Options.Timeout), m.Name, s.Name)
+					}
+					if s.Options.Tries > 0 {
+						g(c.supervisorMaxTries, float64(s.Options.Tries), m.Name, s.Name)
+					}
+					if s.Options.Memory > 0 {
+						g(c.supervisorMemory, float64(s.Options.Memory), m.Name, s.Name)
+					}
 				}
 			}
 		}
 	}
 
 	// ── Pending jobs ─────────────────────────────────────────────────────────
-	if counts, err := c.client.GetPendingJobCounts(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching pending jobs: %v", err)
-		}
-	} else {
-		g(c.pendingTotal, float64(counts.Total))
-		for q, n := range counts.ByQueue {
-			g(c.pendingByQueue, float64(n), q)
-		}
-		for cls, n := range counts.ByClass {
-			g(c.pendingByClass, float64(n), cls)
+	if !c.skip("jobs/pending") {
+		if counts, err := c.client.GetPendingJobCounts(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching pending jobs: %v", err)
+			}
+		} else {
+			g(c.pendingTotal, float64(counts.Total))
+			for q, n := range counts.ByQueue {
+				g(c.pendingByQueue, float64(n), q)
+			}
+			for cls, n := range counts.ByClass {
+				g(c.pendingByClass, float64(n), cls)
+			}
 		}
 	}
 
 	// ── Completed jobs ───────────────────────────────────────────────────────
-	if counts, err := c.client.GetCompletedJobCounts(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching completed jobs: %v", err)
-		}
-	} else {
-		g(c.completedTotal, float64(counts.Total))
-		for q, n := range counts.ByQueue {
-			g(c.completedByQueue, float64(n), q)
-		}
-		for cls, n := range counts.ByClass {
-			g(c.completedByClass, float64(n), cls)
+	if !c.skip("jobs/completed") {
+		if counts, err := c.client.GetCompletedJobCounts(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching completed jobs: %v", err)
+			}
+		} else {
+			g(c.completedTotal, float64(counts.Total))
+			for q, n := range counts.ByQueue {
+				g(c.completedByQueue, float64(n), q)
+			}
+			for cls, n := range counts.ByClass {
+				g(c.completedByClass, float64(n), cls)
+			}
 		}
 	}
 
 	// ── Silenced jobs ────────────────────────────────────────────────────────
-	if counts, err := c.client.GetSilencedJobCounts(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching silenced jobs: %v", err)
-		}
-	} else {
-		g(c.silencedTotal, float64(counts.Total))
-		for q, n := range counts.ByQueue {
-			g(c.silencedByQueue, float64(n), q)
-		}
-		for cls, n := range counts.ByClass {
-			g(c.silencedByClass, float64(n), cls)
+	if !c.skip("jobs/silenced") {
+		if counts, err := c.client.GetSilencedJobCounts(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching silenced jobs: %v", err)
+			}
+		} else {
+			g(c.silencedTotal, float64(counts.Total))
+			for q, n := range counts.ByQueue {
+				g(c.silencedByQueue, float64(n), q)
+			}
+			for cls, n := range counts.ByClass {
+				g(c.silencedByClass, float64(n), cls)
+			}
 		}
 	}
 
 	// ── Failed jobs ──────────────────────────────────────────────────────────
-	if counts, err := c.client.GetFailedJobCounts(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching failed jobs: %v", err)
-		}
-	} else {
-		g(c.failedTotal, float64(counts.Total))
-		for q, n := range counts.ByQueue {
-			g(c.failedByQueue, float64(n), q)
-		}
-		for cls, n := range counts.ByClass {
-			g(c.failedByClass, float64(n), cls)
+	if !c.skip("jobs/failed") {
+		if counts, err := c.client.GetFailedJobCounts(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching failed jobs: %v", err)
+			}
+		} else {
+			g(c.failedTotal, float64(counts.Total))
+			for q, n := range counts.ByQueue {
+				g(c.failedByQueue, float64(n), q)
+			}
+			for cls, n := range counts.ByClass {
+				g(c.failedByClass, float64(n), cls)
+			}
 		}
 	}
 
 	// ── Monitored tags ───────────────────────────────────────────────────────
-	if tags, err := c.client.GetMonitoredTags(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching monitored tags: %v", err)
-		}
-	} else {
-		for _, t := range tags {
-			g(c.monitoredTagJobs, float64(t.Count), t.Tag)
+	if !c.skip("monitoring") {
+		if tags, err := c.client.GetMonitoredTags(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching monitored tags: %v", err)
+			}
+		} else {
+			for _, t := range tags {
+				g(c.monitoredTagJobs, float64(t.Count), t.Tag)
+			}
 		}
 	}
 
 	// ── Batches ──────────────────────────────────────────────────────────────
-	if batches, err := c.client.GetBatches(); err != nil {
-		if !errors.Is(err, horizon.ErrEndpointUnavailable) {
-			log.Printf("error fetching batches: %v", err)
-		}
-	} else {
-		type agg struct {
-			pending   int64
-			failed    int64
-			total     int64
-			progress  float64
-			count     int64
-			cancelled int64
-		}
-		byName := make(map[string]*agg, len(batches))
-		for _, b := range batches {
-			a := byName[b.Name]
-			if a == nil {
-				a = &agg{}
-				byName[b.Name] = a
+	if !c.skip("batches") {
+		if batches, err := c.client.GetBatches(); err != nil {
+			if !errors.Is(err, horizon.ErrEndpointUnavailable) {
+				log.Printf("error fetching batches: %v", err)
 			}
-			a.pending += b.PendingJobs
-			a.failed += b.FailedJobs
-			a.total += b.TotalJobs
-			a.progress += b.Progress
-			a.count++
-			if b.CancelledAt != nil {
-				a.cancelled++
+		} else {
+			type agg struct {
+				pending   int64
+				failed    int64
+				total     int64
+				progress  float64
+				count     int64
+				cancelled int64
 			}
-		}
-		g(c.batchTotal, float64(len(batches)))
-		for name, a := range byName {
-			avgProgress := 0.0
-			if a.count > 0 {
-				avgProgress = a.progress / float64(a.count)
+			byName := make(map[string]*agg, len(batches))
+			for _, b := range batches {
+				a := byName[b.Name]
+				if a == nil {
+					a = &agg{}
+					byName[b.Name] = a
+				}
+				a.pending += b.PendingJobs
+				a.failed += b.FailedJobs
+				a.total += b.TotalJobs
+				a.progress += b.Progress
+				a.count++
+				if b.CancelledAt != nil {
+					a.cancelled++
+				}
 			}
-			g(c.batchTotalJobs, float64(a.total), name)
-			g(c.batchPendingJobs, float64(a.pending), name)
-			g(c.batchFailedJobs, float64(a.failed), name)
-			g(c.batchProgress, avgProgress, name)
-			g(c.batchCancelled, float64(a.cancelled), name)
+			g(c.batchTotal, float64(len(batches)))
+			for name, a := range byName {
+				avgProgress := 0.0
+				if a.count > 0 {
+					avgProgress = a.progress / float64(a.count)
+				}
+				g(c.batchTotalJobs, float64(a.total), name)
+				g(c.batchPendingJobs, float64(a.pending), name)
+				g(c.batchFailedJobs, float64(a.failed), name)
+				g(c.batchProgress, avgProgress, name)
+				g(c.batchCancelled, float64(a.cancelled), name)
+			}
 		}
 	}
 }

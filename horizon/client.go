@@ -134,7 +134,7 @@ func (c *Client) getJobCounts(apiPath string) (*JobCounts, error) {
 	}
 
 	cursor := int64(-1)
-	firstPage := true
+	var fetched int64
 	for {
 		path := apiPath + "?starting_at=" + strconv.FormatInt(cursor, 10)
 		var page JobListResponse
@@ -142,17 +142,17 @@ func (c *Client) getJobCounts(apiPath string) (*JobCounts, error) {
 			return nil, err
 		}
 
-		if firstPage {
+		if counts.Total == 0 {
 			counts.Total = page.Total
-			firstPage = false
 		}
 
 		for _, j := range page.Jobs {
 			counts.ByQueue[j.Queue]++
 			counts.ByClass[j.Name]++
+			fetched++
 		}
 
-		if len(page.Jobs) < jobPageSize {
+		if len(page.Jobs) == 0 || fetched >= counts.Total {
 			break
 		}
 
